@@ -1,4 +1,5 @@
-from backend.app.analytics import concentration, risk_metrics
+from backend.app.analytics import concentration, health_score, insights, risk_metrics
+from backend.app.main import parse_csv
 
 
 def test_volatility_and_drawdown_match_known_series():
@@ -20,4 +21,28 @@ def test_hhi_and_effective_holdings():
 def test_risk_is_unavailable_for_insufficient_or_invalid_history():
     assert risk_metrics([100, 101])["status"] == "insufficient_data"
     assert risk_metrics([100, 0, 101])["status"] == "insufficient_data"
+
+
+def test_csv_preview_flags_unmatched_rows_and_invalid_quantity():
+    content = "\n".join([
+        "asset_type,quantity,symbol,average_cost",
+        "equity,3,UNMAPPED,10",
+        "equity,0,BAD,5",
+        "equity,2,,7",
+    ])
+    result = parse_csv(content)
+    assert result["requires_confirmation"] is True
+    assert len(result["rows"]) == 1
+    assert result["rows"][0]["status"] == "unmatched_needs_review"
+    assert len(result["errors"]) == 2
+
+
+def test_empty_portfolio_does_not_generate_false_coverage_insight():
+    assert insights({}, {"eligible_exposure": 0, "coverage_percentage": 0, "companies": []}) == []
+
+
+def test_health_score_is_not_created_without_data():
+    result = health_score({"eligible_exposure": 0, "coverage_percentage": 0, "companies": []}, {"status": "insufficient_data"})
+    assert result["status"] == "incomplete"
+    assert result["score"] is None
 

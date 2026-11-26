@@ -20,7 +20,7 @@ FORMATS = {
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description="Ingest a reviewed normalized CSV file.")
     parser.add_argument("dataset", choices=FORMATS)
     parser.add_argument("csv_path")
     parser.add_argument("--provider", required=True)

@@ -12,7 +12,7 @@ from fastapi import Cookie, Depends, FastAPI, File, HTTPException, Request, Resp
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from .analytics import exposure, insights, portfolio_snapshot
+from .analytics import benchmark_series, exposure, health_score, historical_portfolio_series, historical_risk, insights, portfolio_snapshot
 from .config import settings
 from .db import close, connect, get_db
 from .schemas import CopilotRequest, CsvConfirmation, HoldingInput, LoginRequest, RegisterRequest
@@ -203,11 +203,15 @@ def parse_csv(content: str) -> dict:
     headers = {header.strip().lower() for header in (reader.fieldnames or [])}
     if not required.issubset(headers) or not ({"symbol", "isin", "scheme_code"} & headers):
         raise HTTPException(status_code=422, detail={"code": "invalid_csv_headers", "required": ["asset_type", "quantity", "symbol or isin or scheme_code"]})
+    if not reader.fieldnames:
+        raise HTTPException(status_code=422, detail={"code": "empty_csv"})
     rows, errors, seen = [], [], set()
     for line_number, row in enumerate(reader, start=2):
         normalized = {(key or "").strip().lower(): (value or "").strip() for key, value in row.items()}
         identifier = normalized.get("isin") or normalized.get("scheme_code") or normalized.get("symbol")
         try:
+            if not identifier:
+                raise ValueError("security identifier is required")
             quantity = float(normalized.get("quantity", ""))
             if quantity <= 0:
                 raise ValueError("quantity must be positive")
@@ -289,19 +293,39 @@ def analytics_exposure(portfolio_id: str, user=Depends(current_user)):
 @app.get("/api/v1/analytics/allocation")
 def analytics_allocation(portfolio_id: str, user=Depends(current_user)):
     snapshot = portfolio_snapshot(portfolio_id, user["_id"])
+    lookthrough = exposure(portfolio_id, user["_id"])
     totals = {}
-    sectors = {}
     for row in snapshot["positions"]:
         totals[row["asset_type"]] = totals.get(row["asset_type"], 0) + row["market_value"]
-        if row["sector"]:
-            sectors[row["sector"]] = sectors.get(row["sector"], 0) + row["market_value"]
-    return {"data": {"asset_allocation": totals, "sector_allocation": sectors, "total_value": snapshot["total_value"]}}
+    sectors = {}
+    for company in lookthrough["companies"]:
+        sector = company.get("sector") or "Unclassified equity"
+        sectors[sector] = sectors.get(sector, 0) + company["combined_value"]
+    return {"data": {"asset_allocation": totals, "sector_allocation": sectors, "total_value": snapshot["total_value"], "eligible_exposure": lookthrough["eligible_exposure"], "mapped_exposure": lookthrough["verified_mapped_eligible_exposure"], "unmapped_exposure": lookthrough["unmapped_eligible_exposure"], "unassessed_fund_value": lookthrough.get("unassessed_fund_value", 0)}}
+
+
+@app.get("/api/v1/analytics/history")
+def analytics_history(portfolio_id: str, period: str = "1Y", user=Depends(current_user)):
+    require_portfolio(portfolio_id, user["_id"])
+    try:
+        return {"data": historical_portfolio_series(portfolio_id, user["_id"], period)}
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail={"code": "invalid_period"}) from exc
 
 
 @app.get("/api/v1/analytics/risk")
-def analytics_risk(portfolio_id: str, user=Depends(current_user)):
+def analytics_risk(portfolio_id: str, period: str = "1Y", benchmark_id: str = "nifty_50_tri", user=Depends(current_user)):
     require_portfolio(portfolio_id, user["_id"])
-    return {"data": {"status": "insufficient_data", "message": "Historical portfolio series is not yet available. Add verified history through the data ingestion scripts.", "methodology_version": "1.0.0"}}
+    try:
+        history = historical_portfolio_series(portfolio_id, user["_id"], period)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail={"code": "invalid_period"}) from exc
+    if history["status"] != "available":
+        return {"data": {**history, "risk": {"status": "unavailable"}, "health": {"status": "incomplete", "score": None}}}
+    benchmark = benchmark_series(benchmark_id, history["series"][0]["date"], history["series"][-1]["date"])
+    risk = historical_risk(history["series"], benchmark)
+    exposure_data = exposure(portfolio_id, user["_id"])
+    return {"data": {**history, "risk": risk, "health": health_score(exposure_data, risk)}}
 
 
 @app.get("/api/v1/analytics/overlap")
@@ -310,10 +334,56 @@ def analytics_overlap(portfolio_id: str, user=Depends(current_user)):
     return {"data": [row for row in result["companies"] if len(row["fund_sources"]) > 1]}
 
 
-@app.get("/api/v1/analytics/benchmark")
-def analytics_benchmark(portfolio_id: str, benchmark_id: str = "nifty_50_tri", user=Depends(current_user)):
+@app.get("/api/v1/analytics/overlap-matrix")
+def analytics_overlap_matrix(portfolio_id: str, user=Depends(current_user)):
     require_portfolio(portfolio_id, user["_id"])
-    return {"data": {"status": "unavailable", "benchmark_id": benchmark_id, "reason": "No verified benchmark series is loaded yet."}}
+    db = get_db()
+    holdings = list(db.holdings.find({"portfolio_id": portfolio_id, "asset_type": "mutual_fund"}))
+    schemes = []
+    constituents_by_scheme = {}
+    for holding in holdings:
+        scheme_code = holding.get("scheme_code")
+        if not scheme_code:
+            continue
+        rows = list(db.fund_constituents.find({"scheme_code": scheme_code}).sort("reporting_date", -1))
+        if not rows:
+            continue
+        report_date = rows[0]["reporting_date"]
+        latest = [row for row in rows if row["reporting_date"] == report_date]
+        weights = {row.get("mapped_instrument_id"): float(row.get("weight_percentage", 0)) for row in latest if row.get("mapped_instrument_id") and row.get("asset_class", "").lower() in {"equity", "equities", "stock", "listed_equity"}}
+        scheme = db.fund_schemes.find_one({"scheme_code": scheme_code}) or {}
+        schemes.append({"scheme_code": scheme_code, "name": scheme.get("scheme_name", holding.get("instrument_id", scheme_code)), "reporting_date": report_date})
+        constituents_by_scheme[scheme_code] = weights
+    matrix = []
+    for first in schemes:
+        row = {"scheme_code": first["scheme_code"], "name": first["name"], "reporting_date": first["reporting_date"], "values": {}}
+        for second in schemes:
+            a, b = constituents_by_scheme[first["scheme_code"]], constituents_by_scheme[second["scheme_code"]]
+            row["values"][second["scheme_code"]] = sum(min(a.get(key, 0), b.get(key, 0)) for key in set(a) & set(b))
+        matrix.append(row)
+    return {"data": {"schemes": schemes, "matrix": matrix, "unit": "percentage points of scheme weight", "status": "available" if schemes else "unavailable"}}
+
+
+@app.get("/api/v1/analytics/benchmark")
+def analytics_benchmark(portfolio_id: str, benchmark_id: str = "nifty_50_tri", period: str = "1Y", user=Depends(current_user)):
+    require_portfolio(portfolio_id, user["_id"])
+    try:
+        history = historical_portfolio_series(portfolio_id, user["_id"], period)
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail={"code": "invalid_period"}) from exc
+    if history["status"] != "available":
+        return {"data": {"status": "unavailable", "benchmark_id": benchmark_id, "period": period, "reason": history["reason"], "observations": 0}}
+    benchmark = benchmark_series(benchmark_id, history["series"][0]["date"], history["series"][-1]["date"])
+    portfolio_points = {point["date"]: point for point in history["series"]}
+    benchmark_points = {point["date"]: point for point in benchmark}
+    common_dates = sorted(set(portfolio_points) & set(benchmark_points))
+    if len(common_dates) < 2:
+        return {"data": {"status": "unavailable", "benchmark_id": benchmark_id, "period": period, "reason": "Insufficient common dates between the portfolio and TRI series.", "observations": max(len(common_dates)-1, 0)}}
+    start = common_dates[0]
+    portfolio_start = portfolio_points[start]["value"]
+    benchmark_start = benchmark_points[start]["normalized_value"]
+    points = [{"date": day, "portfolio": portfolio_points[day]["value"] / portfolio_start * 100, "benchmark": benchmark_points[day]["normalized_value"] / benchmark_start * 100} for day in common_dates]
+    return {"data": {"status": "available", "benchmark_id": benchmark_id, "period": period, "start_date": common_dates[0], "end_date": common_dates[-1], "observations": len(points)-1, "relative_return_percentage_points": points[-1]["portfolio"]-points[-1]["benchmark"], "portfolio_label": history["label"], "series": points}}
 
 
 @app.get("/api/v1/insights")
