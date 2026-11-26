@@ -1,16 +1,24 @@
-# Data Sources and Usage
+# Demo Data Sources
 
-## Status
+`backend/scripts/bootstrap_demo_data.py` downloads a deliberately small, dated demo dataset. The raw files are kept under `data/raw/demo/`, which is git-ignored. Do not commit downloaded market or disclosure files.
 
-No source has been verified or integrated in this repository. This POC does not claim live data. Before ingestion, verify retrieval access, identifier quality, date coverage, and applicable terms. Do not bypass access controls or redistribute data without permission.
+| Data | Source used | Basis and limitation |
+|---|---|---|
+| NSE equity prices | Yahoo Finance chart endpoint (`query2.finance.yahoo.com`) | Unofficial research-oriented endpoint. Uses unadjusted close for current valuation and adjusted close for historical reconstruction. Check Yahoo's current terms before redistribution. |
+| Mutual fund NAV history | MFAPI (`api.mfapi.in`), cross-checked against the official AMFI latest NAV file | MFAPI is a third-party mirror; AMFI latest NAV and scheme identity must match before data is accepted. Check MFAPI terms before redistribution. |
+| PPFAS Flexi Cap holdings | PPFAS AMC monthly portfolio workbook, reporting date 30 Sep 2026 | Actual disclosed holdings and ISINs. A monthly disclosure is a dated snapshot, not live fund holdings. |
+| SBI Flexicap holdings | SBI Mutual Fund all-schemes monthly workbook, reporting date 31 Oct 2026 | Actual disclosed holdings and ISINs. A monthly disclosure is a dated snapshot, not live fund holdings. |
+| NIFTY 50 / 500 benchmark | Yahoo Finance symbols `^NSEI` and `^CRSLDX` | Price-index series only; dividends are excluded. The official Nifty Indices TRI endpoint redirected to a login page during verification, so the demo does not label these series as TRI. |
 
-Candidate sources:
+The remote requests were tested from the development environment. This confirms technical accessibility at that time; it is not a license grant. The seed script stores source URLs, retrieval time, period, validation status and checksums where available. Terms and redistribution rights remain an operator responsibility.
 
-- Equity history/actions: authorized NSE data or research access through Yahoo/yfinance where its terms permit the intended use.
-- Mutual fund NAV: AMFI historical NAV, requested in windows no longer than 90 days; optional MFapi comparison.
-- Fund holdings: actual dated AMFI/AMC scheme disclosures; prefer machine-readable files and preserve reporting/publication dates.
-- Benchmarks: Nifty Indices historical NIFTY 50 TRI and NIFTY 500 TRI series.
+## Sample portfolio
 
-Each loaded dataset must have a manifest with provider, source URL, retrieval timestamp, covered dates, reporting/publication dates where relevant, currency, adjustment basis, record count, validation status, usage status, and checksum where possible. Data-health API returns manifests. Monthly fund holdings are historical snapshots, not live positions.
+`data/demo/sample_portfolio.csv` contains illustrative investor quantities and no asserted purchase costs. Its symbols and scheme codes are mapped to real instruments. It does not contain market prices or NAVs. Valuation and histories are downloaded from the providers above when bootstrapping the local demo.
 
-For detailed source qualification and fallback strategy, see `planning/DATA_SOURCE_FEASIBILITY.md`.
+## Fallback behavior
+
+- A provider timeout, malformed response, too-short history, or scheme mismatch stops the bootstrap with a clear error; it does not insert placeholder prices.
+- Yahoo is unofficial and may throttle or change its response. Retry later or use a separately reviewed, permitted data export with the normalized CSV ingestion script.
+- The official Nifty TRI endpoint was not accessible without login during verification. The Yahoo price-index fallback is clearly labeled and excludes dividends. Replace it only with a licensed/authorized TRI export; never relabel price returns as TRI.
+- Fund disclosures are pinned to dated official AMC workbooks. Update the URLs and reporting dates only after verifying the actual published files.

@@ -60,6 +60,12 @@ def portfolio_snapshot(portfolio_id: str, owner_id: str) -> dict:
         quantity = number(holding["quantity"])
         value = quantity * price
         total += value
+        disclosure = None
+        if holding["asset_type"] == "mutual_fund":
+            latest_disclosure = db.fund_constituents.find_one(
+                {"scheme_code": holding.get("scheme_code")}, sort=[("reporting_date", -1)]
+            )
+            disclosure = latest_disclosure.get("reporting_date") if latest_disclosure else None
         positions.append({
             "instrument_id": instrument_id,
             "name": instrument.get("name", instrument_id),
@@ -72,6 +78,7 @@ def portfolio_snapshot(portfolio_id: str, owner_id: str) -> dict:
             "market_value": value,
             "average_cost": number(holding.get("average_cost")),
             "as_of": as_of,
+            "fund_reporting_date": disclosure,
         })
     return {"portfolio": portfolio, "positions": positions, "total_value": total, "missing": missing}
 
@@ -109,13 +116,18 @@ def exposure(portfolio_id: str, owner_id: str) -> dict:
         for row in equity_rows:
             weight = number(row.get("weight_percentage"))
             if row.get("mapped_instrument_id") and weight > 0:
-                mapped_total += fund_value * weight / 100
-                indirect[row["mapped_instrument_id"]] += fund_value * weight / 100
+                fund_exposure_value = fund_value * weight / 100
+                mapped_total += fund_exposure_value
+                indirect[row["mapped_instrument_id"]] += fund_exposure_value
                 sources[row["mapped_instrument_id"]].append({
                     "scheme_code": position["scheme_code"],
                     "fund_name": position["name"],
                     "weight_percentage": weight,
+                    "exposure_value": fund_exposure_value,
                     "reporting_date": snapshot_date,
+                    "publication_date": row.get("publication_date"),
+                    "source_url": row.get("source_url"),
+                    "provider": row.get("provider"),
                 })
                 weight_sum += weight
         # Unmapped equity constituents remain in the eligible denominator.
@@ -185,11 +197,23 @@ def concentration(weights: list[float]) -> dict:
 
 def insights(snapshot: dict, exposure_data: dict) -> list[dict]:
     result = []
+    portfolio_dates = [position.get("as_of") for position in snapshot.get("positions", []) if position.get("as_of")]
+    market_as_of = max(portfolio_dates, default=None)
     if exposure_data["eligible_exposure"] > 0 and exposure_data["coverage_percentage"] < 80:
-        result.append({"id": "coverage", "severity": "medium", "title": "Some eligible exposure is not mapped", "explanation": "Look-through coverage is incomplete, so hidden company exposure may be understated.", "coverage_percentage": exposure_data["coverage_percentage"], "as_of": date.today().isoformat(), "route": "/diversification"})
+        result.append({"id": "coverage", "severity": "medium", "title": "Some eligible exposure is not mapped", "explanation": "Look-through coverage is incomplete, so hidden company exposure may be understated.", "coverage_percentage": exposure_data["coverage_percentage"], "as_of": market_as_of, "route": "/diversification"})
     for company in exposure_data["companies"]:
         if company["portfolio_percentage"] >= 15:
-            result.append({"id": f"concentration-{company['instrument_id']}", "severity": "high", "title": f"{company['name']} is a large combined exposure", "explanation": "This includes direct holdings and disclosed mutual fund exposure.", "portfolio_percentage": company["portfolio_percentage"], "evidence": company, "as_of": date.today().isoformat(), "route": "/diversification"})
+            result.append({"id": f"concentration-{company['instrument_id']}", "severity": "high", "title": f"{company['name']} is a large combined exposure", "explanation": "This includes direct holdings and disclosed mutual fund exposure.", "portfolio_percentage": company["portfolio_percentage"], "evidence": company, "as_of": market_as_of, "route": "/diversification"})
+    overlaps = [company for company in exposure_data["companies"] if len(company.get("fund_sources", [])) > 1]
+    if overlaps:
+        company = max(overlaps, key=lambda item: item["indirect_value"])
+        reports = [source.get("reporting_date") for source in company["fund_sources"] if source.get("reporting_date")]
+        result.append({
+            "id": f"fund-overlap-{company['instrument_id']}", "severity": "low",
+            "title": f"{company['name']} appears in both mutual funds",
+            "explanation": f"Both dated fund disclosures include {company['name']}; the per-fund holdings and dates are shown below. This is a look-through observation, not a forecast.",
+            "evidence": company, "as_of": max(reports, default=None), "route": "/diversification",
+        })
     return result
 
 
@@ -265,8 +289,13 @@ def historical_portfolio_series(portfolio_id: str, owner_id: str, period: str = 
 
 def benchmark_series(benchmark_id: str, start_date: str, end_date: str) -> list[dict]:
     rows = list(get_db().benchmark_values.find({"benchmark_id": benchmark_id}).sort("date", 1))
-    values = {_date_key(row["date"]): number(row.get("index_value")) for row in rows if start_date <= _date_key(row["date"]) <= end_date and str(row.get("return_type", "")).lower() in {"tri", "total_return"} and number(row.get("index_value")) > 0}
-    return [{"date": day, "normalized_value": value / next(iter(values.values())) * 100} for day, value in values.items()] if values else []
+    values = [row for row in rows if start_date <= _date_key(row["date"]) <= end_date and str(row.get("return_type", "")).lower() in {"tri", "total_return", "price_index"} and number(row.get("index_value")) > 0]
+    if not values:
+        return []
+    initial = number(values[0].get("index_value"))
+    return [{"date": _date_key(row["date"]), "normalized_value": number(row["index_value"]) / initial * 100,
+             "return_type": row.get("return_type"), "benchmark_label": row.get("benchmark_label")}
+            for row in values]
 
 
 def historical_risk(series: list[dict], benchmark: list[dict] | None = None) -> dict:

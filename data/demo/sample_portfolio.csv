@@ -1,0 +1,8 @@
+asset_type,quantity,symbol,isin,scheme_code,average_cost
+equity,20,HDFCBANK.NS,INE040A01034,,
+equity,10,ICICIBANK.NS,INE090A01021,,
+equity,5,RELIANCE.NS,INE002A01018,,
+equity,6,INFY.NS,INE009A01021,,
+equity,2,TCS.NS,INE467B01029,,
+mutual_fund,1000,,,122639,
+mutual_fund,500,,,119718,

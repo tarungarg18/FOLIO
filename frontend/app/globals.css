@@ -5,6 +5,6 @@
 
 :root { color-scheme: light; }
 * { box-sizing: border-box; }
-body { margin: 0; background: #f7f6f0; color: #252c29; font-family: Arial, sans-serif; }
+body { margin: 0; background: #f7f6f0; color: #252c29; font-family: "DM Sans", sans-serif; }
 button, input { font: inherit; }
 .number { font-variant-numeric: tabular-nums; }

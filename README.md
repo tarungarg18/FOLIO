@@ -4,7 +4,7 @@ Portfolio intelligence for Indian retail investors. FOLIO focuses on what an inv
 
 ## Current project status
 
-This repository is the initial POC foundation. The API, local MongoDB integration, CSV preview, basic portfolio valuation/look-through, Gemini fallback, and responsive dashboard shell are present. Provider-specific data adapters, verified source data, full authentication UI, historical risk/benchmark series, and complete Figma screen set are not complete. The app intentionally shows unavailable states rather than fabricated market figures.
+The local POC includes a sourced demo data bootstrap, illustrative sample holdings CSV, portfolio valuation and fund look-through, historical reconstruction, risk and benchmark views, CSV review/import, and a responsive dashboard. Provider access and data rights can change; source dates and usage limitations are recorded in `docs/DATA_SOURCES.md`.
 
 ## Requirements
 
@@ -37,16 +37,17 @@ npm run dev
 
 Open `http://localhost:3000`; API docs are at `http://localhost:8000/docs`. Health endpoint: `http://localhost:8000/health`.
 
-## Data loading
+## Load the demo portfolio
 
-Remote provider retrieval is deliberately not enabled until access and usage conditions are verified. Download and inspect permitted provider files, then use the CSV ingestion utility described in `docs/DATA_DICTIONARY.md`. Run validation with:
+After starting local MongoDB and installing backend requirements, run once from `backend`:
 
 ```powershell
-cd backend
-python -m scripts.validate_dataset
+python -m scripts.bootstrap_demo_data
 ```
 
-The sample investor positions, if added, must be labelled illustrative. Do not treat a fund's monthly holdings as live holdings.
+This downloads dated source data into the ignored `data/raw/demo/` directory and seeds the local MongoDB database. Sample quantities are illustrative; current values use downloaded closes/NAVs. Historical fund holdings are monthly disclosures, not live holdings. Yahoo's price-index benchmark excludes dividends and is not TRI. Check provider terms before redistributing downloaded data.
+
+The matching sample CSV is available from the dashboard's **Example CSV** link or at `data/demo/sample_portfolio.csv`. CSV import previews instrument matches and requires confirmation before positions are saved.
 
 ## Core financial conventions
 

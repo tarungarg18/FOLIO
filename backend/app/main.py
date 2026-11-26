@@ -5,12 +5,14 @@ import secrets
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
+import re
 
 import httpx
 from bson import ObjectId
 from fastapi import Cookie, Depends, FastAPI, File, HTTPException, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 
 from .analytics import benchmark_series, exposure, health_score, historical_portfolio_series, historical_risk, insights, portfolio_snapshot
 from .config import settings
@@ -20,6 +22,7 @@ from .security import hash_password, issue_session, user_for_token, verify_passw
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("folio")
+SAMPLE_CSV = Path(__file__).resolve().parents[2] / "data" / "demo" / "sample_portfolio.csv"
 
 
 @asynccontextmanager
@@ -139,11 +142,21 @@ def open_demo(response: Response):
         db.users.insert_one(user)
         portfolio_id = str(uuid.uuid4())
         db.portfolios.insert_one({"_id": portfolio_id, "owner_id": user_id, "slug": "illustrative", "name": "Illustrative Investor Portfolio", "is_illustrative": True, "created_at": datetime.now(timezone.utc)})
-        db.data_manifests.insert_one({"dataset": "demo_positions", "status": "synthetic_positions_real_market_data_required", "label": "Illustrative positions; market data must be sourced and traceable"})
+    portfolio = db.portfolios.find_one({"owner_id": user["_id"], "slug": "illustrative"})
+    if not portfolio:
+        portfolio_id = str(uuid.uuid4())
+        portfolio = {"_id": portfolio_id, "owner_id": user["_id"], "slug": "illustrative", "name": "Illustrative Investor Portfolio", "is_illustrative": True, "created_at": datetime.now(timezone.utc)}
+        db.portfolios.insert_one(portfolio)
     token = issue_session(user["_id"])
     response.set_cookie("folio_session", token, httponly=True, secure=settings.cookie_secure, samesite="lax", max_age=settings.session_days * 86400, path="/")
-    portfolio = db.portfolios.find_one({"owner_id": user["_id"]})
     return {"user": {"id": user["_id"], "email": email, "name": user["name"]}, "portfolio": jsonable(portfolio)}
+
+
+@app.get("/api/v1/demo/sample.csv")
+def demo_sample_csv():
+    if not SAMPLE_CSV.is_file():
+        raise HTTPException(status_code=404, detail={"code": "sample_csv_unavailable"})
+    return FileResponse(SAMPLE_CSV, media_type="text/csv", filename="folio_sample_portfolio.csv")
 
 
 @app.get("/api/v1/portfolios")
@@ -171,7 +184,11 @@ def add_holding(portfolio_id: str, payload: HoldingInput, user=Depends(current_u
         raise HTTPException(status_code=422, detail={"code": "scheme_code_required"})
     doc = payload.model_dump()
     doc.update({"_id": str(uuid.uuid4()), "portfolio_id": portfolio_id})
-    get_db().holdings.update_one({"portfolio_id": portfolio_id, "instrument_id": payload.instrument_id}, {"$set": doc}, upsert=True)
+    get_db().holdings.update_one(
+        {"portfolio_id": portfolio_id, "instrument_id": payload.instrument_id},
+        {"$set": {key: value for key, value in doc.items() if key != "_id"}, "$setOnInsert": {"_id": doc["_id"]}},
+        upsert=True,
+    )
     return jsonable(doc)
 
 
@@ -197,7 +214,7 @@ def delete_holding(holding_id: str, user=Depends(current_user)):
     return {"ok": True}
 
 
-def parse_csv(content: str) -> dict:
+def parse_csv(content: str, db=None) -> dict:
     reader = csv.DictReader(io.StringIO(content))
     required = {"asset_type", "quantity"}
     headers = {header.strip().lower() for header in (reader.fieldnames or [])}
@@ -222,7 +239,20 @@ def parse_csv(content: str) -> dict:
             if key in seen:
                 raise ValueError("duplicate row")
             seen.add(key)
-            rows.append({"line": line_number, "identifier": identifier, "isin": normalized.get("isin"), "symbol": normalized.get("symbol"), "scheme_code": normalized.get("scheme_code"), "asset_type": asset_type, "quantity": quantity, "average_cost": float(normalized.get("average_cost") or 0), "status": "unmatched_needs_review"})
+            instrument = None
+            if db is not None:
+                if asset_type == "mutual_fund" and normalized.get("scheme_code"):
+                    scheme = db.fund_schemes.find_one({"scheme_code": normalized["scheme_code"]})
+                    if scheme:
+                        instrument = db.instruments.find_one({"_id": normalized["scheme_code"]})
+                else:
+                    if normalized.get("isin"):
+                        instrument = db.instruments.find_one({"isin": normalized["isin"].upper()})
+                    if not instrument and normalized.get("symbol"):
+                        instrument = db.instruments.find_one({"symbol": {"$regex": f"^{re.escape(normalized['symbol'])}$", "$options": "i"}})
+                if instrument and instrument.get("asset_type", asset_type) != asset_type:
+                    instrument = None
+            rows.append({"line": line_number, "identifier": identifier, "isin": normalized.get("isin"), "symbol": normalized.get("symbol"), "scheme_code": normalized.get("scheme_code"), "asset_type": asset_type, "quantity": quantity, "average_cost": float(normalized.get("average_cost") or 0), "status": "matched" if instrument else "unmatched_needs_review", "instrument_id": instrument.get("_id") if instrument else None, "instrument_name": instrument.get("name") if instrument else None})
         except (TypeError, ValueError) as exc:
             errors.append({"line": line_number, "error": str(exc)})
     return {"rows": rows, "errors": errors, "requires_confirmation": True}
@@ -240,24 +270,26 @@ async def import_preview(portfolio_id: str, file: UploadFile = File(...), user=D
         decoded = content.decode("utf-8-sig")
     except UnicodeDecodeError as exc:
         raise HTTPException(status_code=422, detail={"code": "csv_encoding_invalid"}) from exc
-    return parse_csv(decoded)
+    return parse_csv(decoded, get_db())
 
 
 @app.post("/api/v1/portfolios/{portfolio_id}/import/confirm", status_code=201)
 def import_confirm(portfolio_id: str, payload: CsvConfirmation, user=Depends(current_user)):
     require_portfolio(portfolio_id, user["_id"])
     db = get_db()
-    instruments = {item["_id"] for item in db.instruments.find({}, {"_id": 1})}
-    unresolved = [row.instrument_id for row in payload.rows if row.instrument_id not in instruments]
+    instruments = {item["_id"]: item for item in db.instruments.find({}, {"_id": 1, "asset_type": 1})}
+    unresolved = [row.instrument_id for row in payload.rows if row.instrument_id not in instruments or instruments[row.instrument_id].get("asset_type") not in {None, row.asset_type}]
     if unresolved:
         raise HTTPException(status_code=422, detail={"code": "unresolved_instruments", "identifiers": unresolved})
     docs = []
     for row in payload.rows:
         doc = row.model_dump()
+        if doc["asset_type"] == "mutual_fund" and not doc.get("scheme_code"):
+            raise HTTPException(status_code=422, detail={"code": "scheme_code_required"})
         doc.update({"_id": str(uuid.uuid4()), "portfolio_id": portfolio_id})
         docs.append(doc)
     for doc in docs:
-        db.holdings.update_one({"portfolio_id": portfolio_id, "instrument_id": doc["instrument_id"]}, {"$set": doc}, upsert=True)
+        db.holdings.update_one({"portfolio_id": portfolio_id, "instrument_id": doc["instrument_id"]}, {"$set": {key: value for key, value in doc.items() if key != "_id"}, "$setOnInsert": {"_id": doc["_id"]}}, upsert=True)
     return {"imported": len(docs)}
 
 
@@ -314,7 +346,7 @@ def analytics_history(portfolio_id: str, period: str = "1Y", user=Depends(curren
 
 
 @app.get("/api/v1/analytics/risk")
-def analytics_risk(portfolio_id: str, period: str = "1Y", benchmark_id: str = "nifty_50_tri", user=Depends(current_user)):
+def analytics_risk(portfolio_id: str, period: str = "1Y", benchmark_id: str = "nifty_50_price", user=Depends(current_user)):
     require_portfolio(portfolio_id, user["_id"])
     try:
         history = historical_portfolio_series(portfolio_id, user["_id"], period)
@@ -365,7 +397,7 @@ def analytics_overlap_matrix(portfolio_id: str, user=Depends(current_user)):
 
 
 @app.get("/api/v1/analytics/benchmark")
-def analytics_benchmark(portfolio_id: str, benchmark_id: str = "nifty_50_tri", period: str = "1Y", user=Depends(current_user)):
+def analytics_benchmark(portfolio_id: str, benchmark_id: str = "nifty_50_price", period: str = "1Y", user=Depends(current_user)):
     require_portfolio(portfolio_id, user["_id"])
     try:
         history = historical_portfolio_series(portfolio_id, user["_id"], period)
@@ -378,12 +410,12 @@ def analytics_benchmark(portfolio_id: str, benchmark_id: str = "nifty_50_tri", p
     benchmark_points = {point["date"]: point for point in benchmark}
     common_dates = sorted(set(portfolio_points) & set(benchmark_points))
     if len(common_dates) < 2:
-        return {"data": {"status": "unavailable", "benchmark_id": benchmark_id, "period": period, "reason": "Insufficient common dates between the portfolio and TRI series.", "observations": max(len(common_dates)-1, 0)}}
+        return {"data": {"status": "unavailable", "benchmark_id": benchmark_id, "period": period, "reason": "Insufficient common dates between portfolio and benchmark history.", "observations": max(len(common_dates)-1, 0)}}
     start = common_dates[0]
     portfolio_start = portfolio_points[start]["value"]
     benchmark_start = benchmark_points[start]["normalized_value"]
     points = [{"date": day, "portfolio": portfolio_points[day]["value"] / portfolio_start * 100, "benchmark": benchmark_points[day]["normalized_value"] / benchmark_start * 100} for day in common_dates]
-    return {"data": {"status": "available", "benchmark_id": benchmark_id, "period": period, "start_date": common_dates[0], "end_date": common_dates[-1], "observations": len(points)-1, "relative_return_percentage_points": points[-1]["portfolio"]-points[-1]["benchmark"], "portfolio_label": history["label"], "series": points}}
+    return {"data": {"status": "available", "benchmark_id": benchmark_id, "benchmark_label": benchmark[0].get("benchmark_label", benchmark_id), "benchmark_return_type": benchmark[0].get("return_type"), "benchmark_source": "Yahoo Finance chart endpoint (unofficial)", "period": period, "start_date": common_dates[0], "end_date": common_dates[-1], "observations": len(points)-1, "relative_return_percentage_points": points[-1]["portfolio"]-points[-1]["benchmark"], "portfolio_label": history["label"], "series": points}}
 
 
 @app.get("/api/v1/insights")

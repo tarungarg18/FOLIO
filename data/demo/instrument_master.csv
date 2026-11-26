@@ -1,0 +1,6 @@
+instrument_id,symbol,name,isin,sector
+INE040A01034,HDFCBANK.NS,HDFC Bank Limited,INE040A01034,Banks
+INE090A01021,ICICIBANK.NS,ICICI Bank Limited,INE090A01021,Banks
+INE002A01018,RELIANCE.NS,Reliance Industries Limited,INE002A01018,Petroleum Products
+INE009A01021,INFY.NS,Infosys Limited,INE009A01021,IT - Software
+INE467B01029,TCS.NS,Tata Consultancy Services Limited,INE467B01029,IT - Software
